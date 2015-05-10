@@ -22,12 +22,12 @@
     <parent>
         <artifactId>apache-curator</artifactId>
         <groupId>org.apache.curator</groupId>
-        <version>2.7.2-SNAPSHOT</version>
+        <version>2.8.1-SNAPSHOT</version>
     </parent>
     <modelVersion>4.0.0</modelVersion>
 
     <artifactId>curator-x-rpc</artifactId>
-    <version>2.7.2-SNAPSHOT</version>
+    <version>2.8.1-SNAPSHOT</version>
 
     <name>Curator RPC Proxy</name>
     <description>A proxy that bridges non-java environments with the Curator framework and recipes</description>
@@ -163,6 +163,14 @@
                         </configuration>
                     </execution>
                 </executions>
+            </plugin>
+
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>clirr-maven-plugin</artifactId>
+                <configuration>
+                    <skip>true</skip> <!-- Clirr plugin can't handle shaded JARs - TODO -->
+                </configuration>
             </plugin>
         </plugins>
     </build>
