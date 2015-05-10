@@ -33,9 +33,12 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.ReentrantLock;
 
 class ConnectionState implements Watcher, Closeable
 {
@@ -51,6 +54,7 @@ class ConnectionState implements Watcher, Closeable
     private final Queue<Exception> backgroundExceptions = new ConcurrentLinkedQueue<Exception>();
     private final Queue<Watcher> parentWatchers = new ConcurrentLinkedQueue<Watcher>();
     private final AtomicLong instanceIndex = new AtomicLong();
+    private final ReentrantLock lock = new ReentrantLock();
     private volatile long connectionStartMs = 0;
 
     ConnectionState(ZookeeperFactory zookeeperFactory, EnsembleProvider ensembleProvider, int sessionTimeoutMs, int connectionTimeoutMs, Watcher parentWatcher, AtomicReference<TracerDriver> tracer, boolean canBeReadOnly)
@@ -171,51 +175,73 @@ class ConnectionState implements Watcher, Closeable
         return ensembleProvider;
     }
 
-    private synchronized void checkTimeouts() throws Exception
+    private void checkTimeouts() throws Exception
     {
-        int minTimeout = Math.min(sessionTimeoutMs, connectionTimeoutMs);
-        long elapsed = System.currentTimeMillis() - connectionStartMs;
-        if ( elapsed >= minTimeout )
-        {
-            if ( zooKeeper.hasNewConnectionString() )
-            {
-                handleNewConnectionString();
+        try {
+            int minTimeout = Math.min(sessionTimeoutMs, connectionTimeoutMs);
+            if (lock.tryLock(minTimeout * 2, TimeUnit.MILLISECONDS)) {
+                long elapsed = System.currentTimeMillis() - connectionStartMs;
+                if ( elapsed >= minTimeout )
+                {
+                    if ( zooKeeper.hasNewConnectionString() )
+                    {
+                        handleNewConnectionString();
+                    }
+                    else
+                    {
+                        int maxTimeout = Math.max(sessionTimeoutMs, connectionTimeoutMs);
+                        if ( elapsed > maxTimeout )
+                        {
+                            if ( !Boolean.getBoolean(DebugUtils.PROPERTY_DONT_LOG_CONNECTION_ISSUES) )
+                            {
+                                log.warn(String.format("Connection attempt unsuccessful after %d (greater than max timeout of %d). Resetting connection and trying again with a new connection.", elapsed, maxTimeout));
+                            }
+                            reset();
+                        }
+                        else
+                        {
+                            KeeperException.ConnectionLossException connectionLossException = new CuratorConnectionLossException();
+                            if ( !Boolean.getBoolean(DebugUtils.PROPERTY_DONT_LOG_CONNECTION_ISSUES) )
+                            {
+                                log.error(String.format("Connection timed out for connection string (%s) and timeout (%d) / elapsed (%d)", zooKeeper.getConnectionString(), connectionTimeoutMs, elapsed), connectionLossException);
+                            }
+                            tracer.get().addCount("connections-timed-out", 1);
+                            throw connectionLossException;
+                        }
+                    }
+                }
+            } else {
+                throw new TimeoutException("Failed to acquire lock during ConnectionState:checkTimeouts");
             }
-            else
-            {
-                int maxTimeout = Math.max(sessionTimeoutMs, connectionTimeoutMs);
-                if ( elapsed > maxTimeout )
-                {
-                    if ( !Boolean.getBoolean(DebugUtils.PROPERTY_DONT_LOG_CONNECTION_ISSUES) )
-                    {
-                        log.warn(String.format("Connection attempt unsuccessful after %d (greater than max timeout of %d). Resetting connection and trying again with a new connection.", elapsed, maxTimeout));
-                    }
-                    reset();
-                }
-                else
-                {
-                    KeeperException.ConnectionLossException connectionLossException = new CuratorConnectionLossException();
-                    if ( !Boolean.getBoolean(DebugUtils.PROPERTY_DONT_LOG_CONNECTION_ISSUES) )
-                    {
-                        log.error(String.format("Connection timed out for connection string (%s) and timeout (%d) / elapsed (%d)", zooKeeper.getConnectionString(), connectionTimeoutMs, elapsed), connectionLossException);
-                    }
-                    tracer.get().addCount("connections-timed-out", 1);
-                    throw connectionLossException;
-                }
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
             }
         }
     }
 
-    private synchronized void reset() throws Exception
+    private void reset() throws Exception
     {
         log.debug("reset");
 
-        instanceIndex.incrementAndGet();
+        try {
+            int minTimeout = Math.min(sessionTimeoutMs, connectionTimeoutMs);
+            if (lock.tryLock(minTimeout * 2, TimeUnit.MILLISECONDS)) {
 
-        isConnected.set(false);
-        connectionStartMs = System.currentTimeMillis();
-        zooKeeper.closeAndReset();
-        zooKeeper.getZooKeeper();   // initiate connection
+                instanceIndex.incrementAndGet();
+
+                isConnected.set(false);
+                connectionStartMs = System.currentTimeMillis();
+                zooKeeper.closeAndReset();
+                zooKeeper.getZooKeeper();   // initiate connection
+            } else {
+                throw new TimeoutException("Failed to acquire lock during ConnectionState:reset");
+            }
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
     }
 
     private boolean checkState(Event.KeeperState state, boolean wasConnected)
